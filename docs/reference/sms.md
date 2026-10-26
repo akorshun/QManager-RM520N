@@ -20,6 +20,7 @@ The SMS Center exposes a read/send/delete inbox at `/cellular/sms`. All modem ac
 | AT channel | `/dev/smd11` (Qualcomm SMD char device, not a UART/TTY) |
 | Shared AT lock | `/tmp/qmanager_at.lock` (the same lock `qcmd` holds) |
 | Binary | `/usr/bin/sms_tool` (patched, static **armhf**, ~440 KB) |
+| UCS-2 sender | `/usr/bin/qmanager_sms_send_ucs2` (needs Entware `python3-light`) — see [Non-GSM text](#non-gsm-text-ucs-2-sender) |
 | Boot routing oneshot | `/usr/bin/qmanager_sms_storage` + `qmanager-sms-storage.service` |
 | Read-state hook | `hooks/use-sms-read-state.ts` (browser `localStorage`, key `qmanager.sms.read.v1`) |
 | Data hook | `hooks/use-sms.ts` (`useSms` — no polling, single-flight, see [GET is not free](#the-get-is-not-side-effect-free)) |
@@ -57,6 +58,20 @@ sms_tool [-s ME|SM] delete all     # Clear all messages in that storage
 sms_tool [-s ME|SM] status         # "Storage type: ME, used: 0, total: 255"
 sms_tool at '<AT command>'         # Raw AT passthrough (talks to /dev/smd11)
 ```
+
+### Non-GSM text (UCS-2 sender)
+
+`sms_tool send` encodes GSM 7-bit only: every character outside the GSM alphabet (Cyrillic, Greek, CJK, emoji) is silently replaced with `?`. Its `-c` flag only affects USSD, and locale / `GCONV_PATH` do not change it. So when the message contains any non-ASCII byte, `sms.sh` routes the send through `/usr/bin/qmanager_sms_send_ucs2` instead; pure-ASCII text keeps the `sms_tool` path.
+
+The helper (Python, run by Entware's `/opt/bin/python3`) reads the SMSC with `AT+CSCA?`, switches to PDU mode (`AT+CMGF=0`) and submits SMS-SUBMIT PDUs with `DCS=0x08` (UCS-2):
+
+- **Length.** Up to 70 UTF-16 units go as one SMS. Longer text is sent as a concatenated SMS: 67 units per part behind a 6-octet UDH (IE `00`, 8-bit random reference), never splitting a surrogate pair, so the phone shows one message.
+- **Number type.** `normalize_phone` has already stripped the `+`; destinations of 10+ digits use the international type (`0x91`), shorter ones (operator short codes such as `900`) the national type (`0x81`).
+- **Locking and bounds.** `sms_ucs2_locked()` holds `/tmp/qmanager_at.lock` exactly like `sms_locked()` and wraps the helper in `qm_timeout 90`. Inside the helper every read is `select()`-bounded: a plain blocking read on `/dev/smd11` never returns when a reply is missed, which used to leave the lock held and every later SMS request failing with `modem_busy`. The fd stays blocking because the smd driver rejects non-blocking writes with `EBUSY`.
+- **Exit codes.** `0` all parts accepted (`+CMGS`), `1` failed or only partly sent, `2` usage, `124` killed by `qm_timeout`. Any non-zero code maps to `send_failed`.
+- **Dependency.** `python3-light` is installed by `ensure_sms_python()` in `install_rm520n.sh`, which runs even with `--skip-packages` so in-app updates get it too. If `/opt/bin/python3` is missing, `sms.sh` logs a warning and falls back to `sms_tool`.
+
+Based on the SMS_Cyr add-on by a181 on [4PDA](https://4pda.to/forum/index.php?showtopic=1106442&view=findpost&p=145380693); concatenation, the number-type rule and the bounded reads were added when it was ported here.
 
 ---
 

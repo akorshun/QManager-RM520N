@@ -11,6 +11,7 @@ The **Sites** monitor goes live: a new **Now** view refreshes every site's respo
 ## 🐛 Fixes
 
 - **Dota 2 shows its logo in Sites.** Adding `dota2.com` used to show only a letter because the site's own icon is too small to use; it now has a built-in logo.
+- **SMS in Cyrillic, Greek, CJK and emoji arrive as written.** **SMS Center** used to send every character outside the basic GSM alphabet as `?`. Such messages now go out as UCS-2, and text longer than 70 characters arrives as one joined message. This needs Entware's `python3-light` (about 7 MB), which the installer and in-app updates now add; if it cannot be installed, sending works as before. Thanks to a181 on 4PDA for the original fix.
 
 ## 📥 Installation
 

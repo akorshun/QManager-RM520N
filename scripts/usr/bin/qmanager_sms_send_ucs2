@@ -1,0 +1,201 @@
+#!/opt/bin/python3
+# =============================================================================
+# qmanager_sms_send_ucs2 — send an SMS as UCS-2 PDUs (non-GSM text)
+# =============================================================================
+# sms_tool's encoder is GSM 7-bit only: every character outside the GSM
+# alphabet (Cyrillic, Greek, CJK, emoji) is silently replaced with '?', and its
+# -c flag applies to USSD only. This helper builds the PDUs itself with
+# DCS=0x08 (UCS-2) and submits them over the AT pipe in PDU mode.
+#
+# Messages longer than one UCS-2 SMS (70 UTF-16 units) are sent as a
+# concatenated SMS: 67 units per part behind an 8-bit-reference UDH, never
+# splitting a surrogate pair. Destinations of 10+ digits use the international
+# type of number (sms.sh normalize_phone already stripped the '+'); shorter
+# ones (operator short codes such as 900 or 0611) use the national type.
+#
+# Caller contract (cellular/sms.sh, sms_python_locked):
+#   - holds /tmp/qmanager_at.lock (fd 9) for the whole call
+#   - bounds it with qm_timeout; every read here is select()-bounded as well,
+#     because a blocking read on /dev/smd11 never returns if a reply is missed
+#     (non-blocking mode is not an option: smd rejects writes with EBUSY)
+#
+# Usage:   qmanager_sms_send_ucs2 <phone> <utf8_text>
+# Exit:    0 sent (all parts), 1 failed or partially sent, 2 usage
+# Debug:   SMS_DEBUG=1 logs AT traffic to stderr
+#
+# Based on send_sms_ucs2.py from the SMS_Cyr add-on by a181 (4PDA):
+#   https://4pda.to/forum/index.php?showtopic=1106442&view=findpost&p=145380693
+# =============================================================================
+
+import os
+import re
+import select
+import sys
+import time
+
+DEV = "/dev/smd11"
+DEBUG = os.environ.get("SMS_DEBUG", "") != ""
+
+SINGLE_UNITS = 70   # UTF-16 units in one UCS-2 SMS (140 octets)
+PART_UNITS = 67     # per part once the 6-octet concatenation UDH is added
+
+
+def log(msg):
+    if DEBUG:
+        sys.stderr.write("[sms_ucs2] %s\n" % msg)
+
+
+def swap_nibbles(digits):
+    return "".join(digits[i + 1] + digits[i] for i in range(0, len(digits), 2))
+
+
+def smsc_to_pdu(smsc):
+    smsc = smsc.lstrip("+")
+    if len(smsc) % 2:
+        smsc += "F"
+    swapped = swap_nibbles(smsc)
+    # length counts the type-of-address octet plus the BCD digits
+    return "%02X" % (1 + len(swapped) // 2) + "91" + swapped
+
+
+def phone_to_pdu(number):
+    intl = number.startswith("+")
+    number = number.lstrip("+")
+    toa = "91" if intl or len(number) >= 10 else "81"
+    ndigits = len(number)
+    if len(number) % 2:
+        number += "F"
+    return "%02X" % ndigits + toa + swap_nibbles(number)
+
+
+def split_ucs2(units, size):
+    # Chunks of at most `size` UTF-16 units; never end a chunk on a high
+    # surrogate, so an emoji is not cut in half across two parts.
+    parts, i = [], 0
+    while i < len(units):
+        end = min(i + size * 2, len(units))
+        if end < len(units) and 0xD8 <= units[end - 2] <= 0xDB:
+            end -= 2
+        parts.append(units[i:end])
+        i = end
+    return parts
+
+
+def build_pdus(smsc, number, text):
+    smsc_part = smsc_to_pdu(smsc)
+    dest = phone_to_pdu(number)
+    units = text.encode("utf-16-be")
+    if len(units) <= SINGLE_UNITS * 2:
+        chunks, ref = [units], None
+    else:
+        chunks, ref = split_ucs2(units, PART_UNITS), os.urandom(1)[0]
+    out = []
+    for seq, chunk in enumerate(chunks, 1):
+        if ref is None:
+            first_octet, ud = "11", chunk
+        else:
+            # UDHI set; IE 00 = concatenated SMS, 8-bit reference
+            first_octet = "51"
+            ud = bytes([5, 0, 3, ref, len(chunks), seq]) + chunk
+        # SMS-SUBMIT: first octet, MR 00, DA, PID 00, DCS 08, VP AA (4 days)
+        tpdu = first_octet + "00" + dest + "0008" + "AA" + "%02X" % len(ud) + ud.hex().upper()
+        out.append((smsc_part + tpdu, len(tpdu) // 2))
+    return out
+
+
+def read_until(fd, needles, timeout):
+    data = b""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        ready, _, _ = select.select([fd], [], [], 0.2)
+        if not ready:
+            continue
+        try:
+            chunk = os.read(fd, 4096)
+        except OSError:
+            break
+        if chunk:
+            data += chunk
+            for n in needles:
+                if n in data:
+                    return data, n
+    return data, None
+
+
+def error_reason(fd, data, fallback):
+    # "+CMS ERROR: 350" can arrive split across reads; give the code a moment.
+    if b"ERROR:" in data and not re.search(rb'ERROR:\s*\d+\s*\r', data):
+        more, _ = read_until(fd, [b"\r\n"], timeout=1)
+        data += more
+    m = re.search(rb'\+CM[SE] ERROR:\s*(\d+)', data)
+    if m:
+        return "code: %s" % m.group(1).decode()
+    return "ERROR" if b"ERROR" in data else fallback
+
+
+def send_at(fd, cmd, timeout=3):
+    os.write(fd, (cmd + "\r").encode("ascii"))
+    data, _ = read_until(fd, [b"OK", b"ERROR"], timeout)
+    return data
+
+
+def main():
+    if len(sys.argv) < 3:
+        sys.stderr.write("usage: qmanager_sms_send_ucs2 <phone> <text>\n")
+        sys.exit(2)
+    phone, text = sys.argv[1], sys.argv[2]
+
+    try:
+        fd = os.open(DEV, os.O_RDWR | os.O_NOCTTY)
+    except OSError as e:
+        sys.stderr.write("open %s failed: %s\n" % (DEV, e))
+        sys.exit(1)
+
+    try:
+        data = send_at(fd, "AT+CSCA?", timeout=5)
+        log("CSCA response: %r" % data)
+        m = re.search(rb'\+CSCA:\s*"([^"]+)"', data)
+        if not m:
+            sys.stderr.write("could not read SMSC (AT+CSCA?)\n")
+            sys.exit(1)
+        smsc = m.group(1).decode("ascii")
+
+        pdus = build_pdus(smsc, phone, text)
+        send_at(fd, "AT+CMGF=0", timeout=3)
+
+        refs = []
+        reason = ""
+        for pdu, tp_len in pdus:
+            log("PDU: %s (tp_len=%d)" % (pdu, tp_len))
+            os.write(fd, ("AT+CMGS=%d\r" % tp_len).encode("ascii"))
+            data, found = read_until(fd, [b">", b"ERROR"], timeout=5)
+            if found != b">":
+                log("no CMGS prompt: %r" % data)
+                reason = error_reason(fd, data, "no CMGS prompt")
+                break
+            os.write(fd, (pdu + "\x1a").encode("ascii"))
+            data, _ = read_until(fd, [b"+CMGS", b"ERROR"], timeout=30)
+            log("CMGS response: %r" % data)
+            if b"+CMGS" not in data:
+                reason = error_reason(fd, data, "no response from modem")
+                break
+            m = re.search(rb'\+CMGS:\s*(\d+)', data)
+            refs.append(m.group(1).decode() if m else "?")
+            if b"OK" not in data:
+                read_until(fd, [b"OK"], timeout=2)
+
+        if len(refs) == len(pdus):
+            print("sms sent successfully: %s" % ",".join(refs))
+            sys.exit(0)
+        if refs:
+            print("sms partially sent: %d of %d parts, part %d: %s"
+                  % (len(refs), len(pdus), len(refs) + 1, reason))
+        else:
+            print("sms not sent, %s" % reason)
+        sys.exit(1)
+    finally:
+        os.close(fd)
+
+
+if __name__ == "__main__":
+    main()

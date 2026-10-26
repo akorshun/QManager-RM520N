@@ -801,6 +801,45 @@ ensure_zoneinfo_packages() {
     fi
 }
 
+# Installs Entware's python3-light, which runs qmanager_sms_send_ucs2: SMS text
+# outside the GSM alphabet (Cyrillic, Greek, CJK, emoji) is sent as UCS-2 by
+# that helper, because sms_tool turns those characters into '?'.
+#
+# Runs UNCONDITIONALLY, for the same reason as ensure_zoneinfo_packages(): the
+# in-app update passes --skip-packages, and gating this behind it would leave
+# every existing install sending '?'. Optional and warn-only — without python3
+# sms.sh falls back to sms_tool.
+#
+# Probed by running the interpreter, not by testing for /opt/bin/python3: that
+# binary belongs to python3-base, which on its own cannot even start
+# ("No module named 'linecache'") — measured on RM520N-GL after
+# `opkg remove python3-light`. The import list is the helper's.
+_sms_python_ok() {
+    /opt/bin/python3 -c 'import os, re, select, sys, time' >/dev/null 2>&1
+}
+
+ensure_sms_python() {
+    if [ ! -x "$OPKG" ]; then
+        _log_raw "ensure_sms_python: opkg not available — skipping (pre-Entware)"
+        return 0
+    fi
+
+    if _sms_python_ok; then
+        info "python3 already installed (UCS-2 SMS)"
+        return 0
+    fi
+
+    info "Installing python3-light (UCS-2 SMS)..."
+    if { "$OPKG" install python3-light >/dev/null 2>&1 \
+            || { "$OPKG" update >/dev/null 2>&1 && "$OPKG" install python3-light >/dev/null 2>&1; }; } \
+        && _sms_python_ok; then
+        info "python3-light installed"
+    else
+        warn "Failed to install python3-light (offline?) — SMS text outside the GSM alphabet will be sent as '?'"
+        warn "  Retry manually: $OPKG update && $OPKG install python3-light"
+    fi
+}
+
 # --- Install Bundled Binaries -------------------------------------------------
 
 # Copies the first-party binaries bundled in dependencies/ (atcli_smd11,
@@ -4497,6 +4536,10 @@ main() {
     install_speedtest_cli
 
     [ "$DO_PACKAGES" = "1" ] && install_dependencies
+
+    # ensure_sms_python runs even with --skip-packages (see its doc-comment),
+    # and after install_dependencies so a fresh install already has Entware.
+    ensure_sms_python
 
     # neutralize_entware_lighttpd runs unconditionally (even with
     # --skip-packages, mirroring remove_conflicts/ensure_zoneinfo_packages

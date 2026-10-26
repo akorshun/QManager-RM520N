@@ -52,6 +52,11 @@ cgi_handle_options
 
 # --- Config ------------------------------------------------------------------
 SMS_TOOL="/usr/bin/sms_tool"
+SMS_UCS2="/usr/bin/qmanager_sms_send_ucs2"
+SMS_PYTHON="/opt/bin/python3"
+# Upper bound for one UCS-2 send (all parts of a concatenated SMS); the helper
+# holds the AT lock for its whole run, so it must never be unbounded.
+SMS_UCS2_TIMEOUT=90
 LOCK_FILE="/tmp/qmanager_at.lock"
 # 99 is clear of sms_tool's own 0/1/2, exec failures 126/127, and signal codes 128+N.
 SMS_LOCK_TIMEOUT_RC=99
@@ -102,6 +107,33 @@ sms_locked() {
 
         rm -f "$_sms_err"
         exit "$_sms_rc"
+    ) 9<"$LOCK_FILE"
+}
+
+# --- Locked UCS-2 sender wrapper ---------------------------------------------
+# sms_tool's encoder is GSM 7-bit only and silently turns every non-GSM
+# character into '?' (its -c flag is USSD-only), so text with non-ASCII
+# characters goes through qmanager_sms_send_ucs2 instead, which builds UCS-2
+# PDUs itself. Same lock and the same stdout/stderr contract as sms_locked();
+# the helper is bounded by qm_timeout because it holds the lock while it
+# talks to /dev/smd11 (a timed-out run returns 124, reported as a failure).
+sms_ucs2_locked() {
+    _ucs_err="/tmp/qmanager_sms_ucs2_err.$$"
+    (
+        flock_wait 9 10 || exit "$SMS_LOCK_TIMEOUT_RC"
+        _ucs_out=$(qm_timeout "$SMS_UCS2_TIMEOUT" "$SMS_PYTHON" "$SMS_UCS2" "$1" "$2" 2>"$_ucs_err")
+        _ucs_rc=$?
+
+        if [ "$_ucs_rc" -eq 0 ]; then
+            printf '%s' "$_ucs_out"
+        elif [ -s "$_ucs_err" ]; then
+            cat "$_ucs_err"
+        else
+            printf '%s' "$_ucs_out"
+        fi
+
+        rm -f "$_ucs_err"
+        exit "$_ucs_rc"
     ) 9<"$LOCK_FILE"
 }
 
@@ -516,8 +548,21 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
 
         qlog_info "Sending SMS to $PHONE (raw: $RAW_PHONE)"
 
-        result=$(sms_locked send "$PHONE" "$MESSAGE")
-        sms_rc=$?
+        # Pure ASCII keeps the sms_tool fast path; anything else (Cyrillic,
+        # CJK, emoji...) would come out as '?' from sms_tool, so it goes out
+        # as UCS-2. Without Entware python3 we fall back to sms_tool and say so.
+        non_ascii=$(printf '%s' "$MESSAGE" | LC_ALL=C tr -d '\000-\177')
+        if [ -n "$non_ascii" ] && [ -x "$SMS_PYTHON" ] && [ -f "$SMS_UCS2" ]; then
+            qlog_info "Non-ASCII text, sending as UCS-2"
+            result=$(sms_ucs2_locked "$PHONE" "$MESSAGE")
+            sms_rc=$?
+        else
+            if [ -n "$non_ascii" ]; then
+                qlog_warn "Non-ASCII text but $SMS_PYTHON is missing; sms_tool will replace those characters with '?'"
+            fi
+            result=$(sms_locked send "$PHONE" "$MESSAGE")
+            sms_rc=$?
+        fi
 
         if [ "$sms_rc" -eq "$SMS_LOCK_TIMEOUT_RC" ]; then
             qlog_error "SMS send: could not acquire lock"

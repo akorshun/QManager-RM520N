@@ -507,7 +507,34 @@ export function compareLang(lang: string, base: BaseIndex, opts: { emptyIsMissin
         // fail) — a genuinely useful form we didn't anticipate shouldn't block.
         const enCats = baseBases.get(p.base)!;
         if (enCats.has(p.category) || allowedPlural.has(p.category)) {
-          report.translatedKeys++; // it's a real translated plural form
+          // A real translated plural form (e.g. ru `_few`/`_many`). Not added to
+          // translatedKeys: totalKeys counts English keys only, so counting it
+          // pushed completeness past 100% (and into a built pack's _pack.json).
+          // Its placeholders are checked against English `_other`, the form
+          // it stands in for, so a typo here is caught like anywhere else.
+          const enOther = baseKeys.get(`${p.base}_other`);
+          const val = targetKeys.get(k) ?? "";
+          if (enOther !== undefined && val.trim() !== "") {
+            const phDiff = multisetDiff(placeholders(enOther), placeholders(val));
+            if (phDiff.missing.length || phDiff.extra.length) {
+              const parts: string[] = [];
+              if (phDiff.missing.length) parts.push(`missing ${phDiff.missing.map((v) => `{{${v}}}`).join(", ")}`);
+              if (phDiff.extra.length) parts.push(`unexpected ${phDiff.extra.map((v) => `{{${v}}}`).join(", ")}`);
+              const issue: Issue = {
+                lang,
+                ns,
+                key: k,
+                kind: "placeholder",
+                hard: true,
+                message: `placeholder mismatch — ${parts.join("; ")}. Copy every {{…}} from the English "_other" form exactly; the app fills them with live values`,
+                enValue: enOther,
+                value: val,
+                line: findKeyLine(loaded.raw, k),
+              };
+              report.issues.push(issue);
+              flatIssues.push(issue);
+            }
+          }
           continue;
         }
         const issue: Issue = {

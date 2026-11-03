@@ -29,7 +29,10 @@ jobs:
           bun run i18n:check
 
       - name: Install dependencies
-        run: bun install --frozen-lockfile
+        # tsconfig includes tools/**, whose deps live in tools/modem-mcp
+        run: |
+          bun install --frozen-lockfile
+          bun install --frozen-lockfile --cwd tools/modem-mcp
 
       - name: Next build
         run: bun run build

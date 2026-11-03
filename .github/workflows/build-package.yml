@@ -1,0 +1,50 @@
+# Fork-only CI: builds qmanager.tar.gz from development + the Russian
+# translation for on-device testing. Not part of the upstream PR.
+name: build package
+
+on:
+  push:
+    branches: [ci/ru-build]
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: discord-bot/go.mod
+          cache-dependency-path: discord-bot/go.sum
+
+      - name: Translation checks
+        run: |
+          bun run lang check ru
+          bun run lang check --all
+          bun run i18n:check
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Next build
+        run: bun run build
+
+      - name: Package (icons check + build.sh)
+        run: bun run package
+
+      - name: Russian language pack
+        run: bun run lang build ru --out qmanager-build/lang
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qmanager-ru-${{ github.sha }}
+          path: |
+            qmanager-build/qmanager.tar.gz
+            qmanager-build/sha256sum.txt
+            qmanager-build/lang/
+          if-no-files-found: error
